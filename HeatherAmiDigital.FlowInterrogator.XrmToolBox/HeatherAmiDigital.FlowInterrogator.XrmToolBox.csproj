@@ -25,10 +25,25 @@
     <PackageProjectUrl>https://github.com/heatherami/power-automate-flow-interrogator</PackageProjectUrl>
     <PackageTags>xrmtoolbox plugin dataverse power-automate</PackageTags>
     <PackageReleaseNotes>v0.1.0: definition search, single-flow definition fetch, per-flow run history with run/action detail, and cross-flow run search.</PackageReleaseNotes>
+    <!--
+      Core is a ProjectReference, not a published package, so dotnet pack would
+      otherwise drop it: the plugin would load in XrmToolBox and immediately
+      throw FileNotFoundException for the Core assembly. Bundle Core.dll into
+      lib/ alongside the plugin so the extracted Plugins folder is complete.
+    -->
+    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);IncludeCoreInPackage</TargetsForTfmSpecificBuildOutput>
   </PropertyGroup>
 
+  <Target Name="IncludeCoreInPackage">
+    <ItemGroup>
+      <BuildOutputInPackage Include="$(OutputPath)HeatherAmiDigital.FlowInterrogator.Core.dll" />
+    </ItemGroup>
+  </Target>
+
   <ItemGroup>
-    <ProjectReference Include="..\HeatherAmiDigital.FlowInterrogator.Core\HeatherAmiDigital.FlowInterrogator.Core.csproj" />
+    <!-- PrivateAssets=all: Core is bundled into the package via IncludeCoreInPackage,
+         so it must not also appear as a (non-existent) NuGet dependency. -->
+    <ProjectReference Include="..\HeatherAmiDigital.FlowInterrogator.Core\HeatherAmiDigital.FlowInterrogator.Core.csproj" PrivateAssets="all" />
   </ItemGroup>
 
   <ItemGroup>

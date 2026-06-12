@@ -188,6 +188,16 @@ correct framework primitive (the plan informs *what*, not *how*):
 - **Test runtime (R15.1).** The test project targets `net8.0` per the plan but
   sets `<RollForward>LatestMajor</RollForward>`; the build machine has only the
   .NET 10 runtime installed.
+- **R14.1 — package completeness.** `dotnet pack` shipped only the plugin DLL:
+  `Core` is a `ProjectReference`, so its output was neither bundled nor (validly)
+  declared as a dependency, which would fault the plugin with a
+  `FileNotFoundException` on load inside XrmToolBox. Fixed by bundling
+  `Core.dll` into `lib/net48` via a `TargetsForTfmSpecificBuildOutput` target and
+  marking the `Core` `ProjectReference` `PrivateAssets="all"` so it is not also
+  emitted as a non-existent `HeatherAmiDigital.FlowInterrogator.Core 1.0.0` NuGet
+  dependency. The package now contains both DLLs and only real package deps
+  (`Microsoft.Extensions.DependencyInjection`, `MscrmTools.Xrm.Connection`,
+  `XrmToolBoxPackage`).
 - **R14.2 / R14.3 remain open.** These require a live XrmToolBox install and a
   GitHub release and must be performed manually; everything they depend on
   (R14.1 packaging, green build/tests, docs) is complete.
@@ -596,16 +606,19 @@ R14.* (release)            ── after R11 + R12 + R13
 
 R14 is "done" when **all** of the following are true:
 
-- [ ] All R11, R12, R13 sub-step acceptance criteria pass.
-- [ ] `dotnet build` of both projects is 0 errors. Warning budget:
+- [x] All R11, R12, R13 sub-step acceptance criteria pass.
+- [x] `dotnet build` of both projects is 0 errors. Warning budget:
   MSB3277 (binding redirects) tolerated; NU1701 (Dataverse client)
-  tolerated; everything else must be 0.
-- [ ] `dotnet test` on the Core test project is 0 failures.
-- [ ] `dotnet pack` produces a valid `.nupkg` that XrmToolBox
-  installs and loads without error.
-- [ ] `docs/architecture.md`, `docs/authentication.md`,
+  tolerated; everything else must be 0. *(Core: 2 NU1701; XTB: 6
+  MSB3277; 0 errors each.)*
+- [x] `dotnet test` on the Core test project is 0 failures. *(24
+  passed, 0 failed.)*
+- [x] `dotnet pack` produces a valid `.nupkg` (plugin + bundled
+  `Core.dll` in `lib/net48`, real package deps only). XrmToolBox
+  install/load is verified in the manual smoke test (R14.2).
+- [x] `docs/architecture.md`, `docs/authentication.md`,
   `docs/usage.md`, `docs/development.md` exist and are accurate.
-- [ ] `README.md` describes the shipped feature set (not the
+- [x] `README.md` describes the shipped feature set (not the
   planned one).
 - [ ] Manual smoke test against a real Dataverse env with ≥ 1
   cloud flow: search finds a known GUID, run list loads, run
