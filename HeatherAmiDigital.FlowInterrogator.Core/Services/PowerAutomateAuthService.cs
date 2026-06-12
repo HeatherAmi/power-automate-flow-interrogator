@@ -10,7 +10,7 @@ namespace HeatherAmiDigital.FlowInterrogator.Core.Services;
 /// using the MSAL Device Code flow. Required because Service Principals cannot 
 /// retrieve run history for flows owned by other users.
 /// </summary>
-public sealed class PowerAutomateAuthService
+public sealed class PowerAutomateAuthService : ITokenProvider
 {
     // Well-known multi-tenant client ID for native desktop applications.
     // Replace with a dedicated App Registration ID for formal production deployments.

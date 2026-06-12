@@ -1,8 +1,8 @@
 # Power Automate Flow Interrogator — Project Plan
 
-> Authoritative current-state plan. Supersedes the historical context in
-> `project-plan.md` (which describes a build blocker that no longer reproduces
-> on this machine — see [Build Status](#3-build-status)).
+> Authoritative current-state plan for the implementation work on
+> branch `kilo-v1`. See [Build Status](#3-build-status) for the
+> verified build state of both projects.
 
 ---
 
@@ -58,9 +58,10 @@ Verified on this machine with `dotnet 10.0.300`:
 | Core           | netstandard2.0  | **Builds.** 2 NU1701 warnings (Dataverse client is .NET Fx). |
 | XrmToolBox     | net48           | **Builds.** 6 MSB3277 binding-redirect warnings, 0 errors.    |
 
-The blocking error documented in `project-plan.md` (the
-`MscrmTools.Xrm.Connection` 1.2025.7.63 vs 1.2025.9.64 conflict) does **not**
-reproduce with the current csproj + `app.config` + package versions. The
+A previous version of this plan documented a hard build failure —
+the `MscrmTools.Xrm.Connection` 1.2025.7.63 vs 1.2025.9.64 conflict.
+That conflict does **not** reproduce with the current csproj +
+`app.config` + package versions, so the build is green. The
 manually-authored `app.config` includes explicit `bindingRedirect` entries
 for `McTools.Xrm.Connection` and `McTools.Xrm.Connection.WinForms` to
 `1.2025.7.63`, and the `PackageReference` for `MscrmTools.Xrm.Connection
@@ -148,7 +149,48 @@ dotnet build "HeatherAmiDigital.FlowInterrogator.XrmToolBox\HeatherAmiDigital.Fl
   - Status updates marshalled via `Invoke` when `InvokeRequired`.
 - **FlowInterrogatorSettings** (`SettingsBase`) defines
   `DefaultRunHistoryDays = 7` and `AutoExpandFailedActions = true` — but
-  is **not currently instantiated or wired** to `SettingsManager`.
+   is **not currently instantiated or wired** to `SettingsManager`.
+
+---
+
+## 5.3 Plan corrections made during implementation
+
+Several sub-steps specified an API or type that does not exist in the pinned
+package versions. In each case the plan's *intent* was delivered with the
+correct framework primitive (the plan informs *what*, not *how*):
+
+- **R10.5.1 — plugin export contract.** There is no
+  `XrmToolBox.Extensibility.Interfaces.IXrmToolBoxPluginInterface`. The stub
+  was not dead: the `[Export]` was binding to it, and an empty local interface
+  is never discovered by XrmToolBox. The real contract is `IXrmToolBoxPlugin`
+  (a factory). The control (`FlowInterrogatorPlugin : PluginControlBase`) is
+  now created by a `FlowInterrogatorPluginFactory : PluginBase` that exports
+  `IXrmToolBoxPlugin` and returns the control from `GetControl()`. The export
+  metadata was also corrected to the real `IPluginMetadata` keys
+  (`SmallImageBase64`/`BigImageBase64`; the scaffold's `IconBase64` is not a
+  metadata property) — without them MEF's strongly-typed metadata view rejects
+  the part.
+- **R11.0.1 — settings API.** `SettingsManager` exposes `TryLoad`/`Save`, not
+  `Get`. Loading uses `TryLoad(typeof(FlowInterrogatorSettings), out …)` with a
+  defaults fallback that swallows load failures (a corrupt/missing file must
+  not block the tool).
+- **R11.1.1 — not-found exception.** The SDK has no
+  `Microsoft.Xrm.Sdk.EntityNotFoundException`. A missing record throws
+  `FaultException<OrganizationServiceFault>`; the catch filters on the
+  object-does-not-exist code (`0x80040217`) and returns `null`, rethrowing any
+  other fault.
+- **Testability seam (R12.1 / R15.4).** `FlowRunService` now depends on a new
+  `ITokenProvider` (implemented by `PowerAutomateAuthService`) so HTTP-facing
+  logic is unit-testable with a fake token provider + fake `HttpMessageHandler`.
+- **FlowParser correctness.** Recursive flattening now also descends into a
+  Switch `default` branch (previously only `cases`/`else`), so real flows'
+  default-branch actions are included — required for R15.2's "all leaves".
+- **Test runtime (R15.1).** The test project targets `net8.0` per the plan but
+  sets `<RollForward>LatestMajor</RollForward>`; the build machine has only the
+  .NET 10 runtime installed.
+- **R14.2 / R14.3 remain open.** These require a live XrmToolBox install and a
+  GitHub release and must be performed manually; everything they depend on
+  (R14.1 packaging, green build/tests, docs) is complete.
 
 ---
 
@@ -173,12 +215,20 @@ with a checklist that doubles as the PR description.
 
 ### R10.5 — Housekeeping (do first, unblocks everything else)
 
-- [ ] **R10.5.1** *XS* — Delete `XrmToolBox/IXrmToolBoxPluginInterface.cs`.
-  The file is a dead internal stub; the real interface is exported by
-  `XrmToolBox.Extensibility` and consumed via `[Export(typeof(IXrmToolBox
-  PluginInterface))]` in `FlowInterrogatorPlugin`. *Deps:* none.
-  - **Acceptance:** solution still builds with 0 errors; no references to
-    the stub in the codebase (`grep -r IXrmToolBoxPluginInterface src`).
+- [x] **R10.5.1** *XS* — Delete
+  `HeatherAmiDigital.FlowInterrogator.XrmToolBox/IXrmToolBoxPluginInterface.cs`.
+  The file is a dead internal stub; the real interface is
+  `XrmToolBox.Extensibility.Interfaces.IXrmToolBoxPluginInterface` and
+  is consumed via `[Export(typeof(IXrmToolBoxPluginInterface))]` in
+  `FlowInterrogatorPlugin.cs`. *Deps:* none.
+  - **Acceptance:** solution still builds with 0 errors; `grep -rn
+    "namespace HeatherAmiDigital.FlowInterrogator.XrmToolBox"
+    --include="*.cs"` returns no matches (no other code uses a type
+    from the local stub namespace). The
+    `[Export(typeof(IXrmToolBoxPluginInterface))]` attribute in
+    `FlowInterrogatorPlugin.cs` must continue to resolve — the
+    compiler will fail the build if it doesn't, which is the
+    intended safety net.
 
 ### R11 — Single-record definition fetch + Run list + Run detail
 
@@ -188,7 +238,7 @@ cache, but Refresh does not.
 
 #### R11.0 — Settings wiring (promoted from R13.1; R11.5/11.6 need it)
 
-- [ ] **R11.0.1** *S* — In `FlowInterrogatorPlugin`, load settings in the
+- [x] **R11.0.1** *S* — In `FlowInterrogatorPlugin`, load settings in the
   constructor via `SettingsManager.Instance.Get(typeof(FlowInterrogator
   Settings))`, save in `OnCloseTool`, and expose the instance to
   `MainControl` through a new `Settings` property on the plugin (read
@@ -200,20 +250,26 @@ cache, but Refresh does not.
 
 #### R11.1 — Single-record definition fetch
 
-- [ ] **R11.1.1** *S* — Add `FlowDefinition? GetFlowDefinitionAsync(Guid
-  flowId)` to `FlowQueryService` — single `Retrieve("workflow", id, new
-  ColumnSet("clientdata", "name", "description", "statecode",
-  "modifiedon"))` plus `_parser.ParseDefinition`. Returns `null` if
-  the record no longer exists (deleted between load and selection). *Deps:*
-  R10.5.1.
+- [x] **R11.1.1** *S* — Add `FlowDefinition? GetFlowDefinition(Guid flowId)`
+  to `FlowQueryService` (sync — `IOrganizationService.Retrieve` is
+  sync, so the `Async` suffix would be misleading; reserve `Async`
+  suffixes for the `FlowRunService` HTTP methods). Single
+  `Retrieve("workflow", id, new ColumnSet("clientdata", "name",
+  "description", "statecode", "modifiedon"))` plus
+  `_parser.ParseDefinition`. Returns `null` if the record no longer
+  exists — wrap the `Retrieve` call in `try { … } catch
+  (EntityNotFoundException) { return null; }` (don't use
+  `FaultException`-style catch, the SDK throws
+  `Microsoft.Xrm.Sdk.EntityNotFoundException` from
+  `Microsoft.Xrm.Sdk`). *Deps:* R10.5.1.
   - **Acceptance:** unit test (Core) covering: valid record with
-    clientdata, valid record with empty clientdata, missing record
-    returns null.
+    clientdata, valid record with empty clientdata,
+    `EntityNotFoundException` returns null.
   - **Acceptance:** `MainControl.ShowFlowDetails` cache miss no longer
     shows the "select from Refresh" placeholder — it calls the new
     method and binds the result. Existing `TODO` comment at
     `MainControl.cs:248` is removed.
-- [ ] **R11.1.2** *XS* — Add `PagingInfo` handling to
+- [x] **R11.1.2** *XS* — Add `PagingInfo` handling to
   `FlowQueryService.SearchFlowDefinitions`. With 400+ flows the single
   `RetrieveMultiple` may exceed the 4 MB response cap; page with
   `PagingInfo.PagingCookie = result.PagingCookie` / `PageNumber = 2`
@@ -224,7 +280,7 @@ cache, but Refresh does not.
 
 #### R11.2 — Runs list view
 
-**Proposed default (decides the open question in §8 of the prior plan):**
+**Proposed default:**
 the runs view is **per-flow**, driven by the currently selected row in
 the left grid. Layout: convert the right side from a `TabControl` to a
 **vertical `SplitContainer`** with **Definition / Actions** stacked on
@@ -234,34 +290,58 @@ now*") and avoids a mode toggle. The cross-flow search in R12 uses a
 second grid in a new top-level tab **Run History** so flows and runs
 stay separate concerns.
 
-- [ ] **R11.2.1** *M* — Convert right side to vertical `SplitContainer`.
+- [x] **R11.2.1** *M* — Convert right side to vertical `SplitContainer`.
   Move the existing **Summary** / **Definition JSON** / **Actions**
   tabs into a `TabControl` on `Panel1`. Add an empty `Panel2` for
   runs. Set sensible default `SplitterDistance` (e.g., 60% / 40%).
   *Deps:* R11.1.1.
   - **Acceptance:** existing flows view behaves identically; new runs
     area is visible and empty.
-- [ ] **R11.2.2** *M* — Add a filter strip above the runs grid: a
+- [x] **R11.2.2** *M* — Add a filter strip above the runs grid: a
   `DateTimePicker` (start date, defaults to `DateTime.UtcNow.AddDays
   (-Settings.DefaultRunHistoryDays)`), a status `ComboBox` (Any /
   Succeeded / Failed / Cancelled / Waiting), and a **Refresh runs**
   button. *Deps:* R11.0.1, R11.2.1.
   - **Acceptance:** changing the start date persists in the filter
     strip but not in settings; status selection triggers a re-query.
-- [ ] **R11.2.3** *M* — Wire `FlowRunService.GetRunsAsync` into a new
-  `DataGridView` in `Panel2`. Use `WorkAsync` (see R13.3) with a new
-  helper `MainControl.LoadRunsAsync(Guid flowId)`. Columns: Status
-  (color-coded), Start (UTC + local), End, Duration, Trigger,
-  CorrelationId, **Open in portal** (link-style `DataGridViewLinkCell`
-  with `LinkBehavior.HoverUnderline`, click opens
-  `FlowRun.GetPortalUrl()` in default browser). *Deps:* R11.2.2.
+- [x] **R11.2.3** *M* — Wire `FlowRunService.GetRunsAsync` into a new
+  `DataGridView` in `Panel2`. Use `Task.Run` for now (consistent with
+  existing `MainControl` async pattern); the `WorkAsync` refactor
+  happens uniformly in R13.2.1, don't preempt it here. New helper
+  `MainControl.LoadRunsAsync(Guid flowId)`. Columns: Status
+  (color-coded — see [Status colours](#status-colour-table) below),
+  Start (UTC + local), End, Duration, Trigger, CorrelationId,
+  **Open in portal** (link-style `DataGridViewLinkCell` with
+  `LinkBehavior.HoverUnderline`; handle `CellContentClick`, open
+  `FlowRun.GetPortalUrl()` in default browser via
+  `Process.Start(new ProcessStartInfo(url) { UseShellExecute = true })`
+  — the `UseShellExecute = true` is mandatory on .NET Framework 4.8
+  for `http://` URLs, otherwise you get Win32Exception). *Deps:*
+  R11.2.2.
   - **Acceptance:** clicking a flow row populates the runs grid;
     clicking **Refresh runs** re-runs with current filters; clicking a
-    link opens the browser; status colours match `FlowRunStatus`.
+    link opens the default browser to
+    `https://make.powerautomate.com/environments/{envId}/flows/{flowId}/runs/{runId}`;
+    status colours match `FlowRunStatus`.
+
+##### Status colour table
+
+Pin these in a static `Dictionary<FlowRunStatus, Color>` near the top
+of `MainControl` so R13 doesn't second-guess them:
+
+| `FlowRunStatus` | BackColor   | ForeColor   |
+|-----------------|-------------|-------------|
+| `Succeeded`     | `PaleGreen` | `DarkGreen` |
+| `Failed`        | `LightCoral`| `DarkRed`   |
+| `Cancelled`     | `LightGray` | `Black`     |
+| `Skipped`       | `LightGray` | `Black`     |
+| `Aborted`       | `LightGray` | `Black`     |
+| `Waiting`       | `LightYellow` | `DarkGoldenrod` |
+| `Unknown`       | `White`     | `Black`     |
 
 #### R11.3 — Run detail view
 
-- [ ] **R11.3.1** *M* — When a run row is selected, fetch actions via
+- [x] **R11.3.1** *M* — When a run row is selected, fetch actions via
   `FlowRunService.GetRunActionsAsync` and bind to the existing
   `DataGridView` in the **Actions** tab (which currently shows static
   flow actions). To avoid losing the static view: add a sub-tab
@@ -271,7 +351,7 @@ stay separate concerns.
   - **Acceptance:** selecting a run shows per-action status, start,
     end, duration, error code, error message; switching back to
     **Flow Actions** restores the static definition view.
-- [ ] **R11.3.2** *M* — For the selected run action, render **Inputs**
+- [x] **R11.3.2** *M* — For the selected run action, render **Inputs**
   and **Outputs** as pretty-printed JSON in a side panel (or
   expandable row). Use `JToken.ToString(Formatting.Indented)`, monospace
   font, read-only `TextBox` with `WordWrap = false`. Auto-select the
@@ -293,7 +373,7 @@ on-demand `GetRunActionsAsync` and caches the first error's
 `ErrorMessage` in a `Dictionary<RunId, string>` for subsequent
 filtering. Add a **Search error text** toggle to opt into this.
 
-- [ ] **R12.1** *M* — Add `SearchRunsAsync(string term, DateTime?
+- [x] **R12.1** *M* — Add `SearchRunsAsync(string term, DateTime?
   startDate, FlowRunStatus? statusFilter)` to `Core`. Internally calls
   `FlowRunService.GetRunsAsync` per flow (sequentially — the Flow
   Management API is per-flow and not batchable; parallel is safe up
@@ -303,14 +383,14 @@ filtering. Add a **Search error text** toggle to opt into this.
     canned runs for two flows; assert matches across both flows when
     search term is a `CorrelationId` and across one flow when it's a
     `FlowName` substring.
-- [ ] **R12.2** *S* — Add a top-level tab **Run History** to the
+- [x] **R12.2** *S* — Add a top-level tab **Run History** to the
   `TabControl` host (replace or extend the current `TabControl` with
   a top-level `TabControl` keyed on **Flows** / **Run History**).
   Re-uses the runs filter strip from R11.2.2 and the runs grid from
   R11.2.3. *Deps:* R12.1.
   - **Acceptance:** switching tabs preserves each tab's state
     (selected row, scroll position, filter values).
-- [ ] **R12.3** *M* — Optional **Search error text** toggle
+- [x] **R12.3** *M* — Optional **Search error text** toggle
   (default off) that triggers a one-shot on-demand fetch of the
   first failed action per run when the user types in the search box
   and the term doesn't otherwise match. Cache results in a
@@ -324,7 +404,7 @@ filtering. Add a **Search error text** toggle to opt into this.
 
 #### R13.1 — Logging
 
-- [ ] **R13.1.1** *S* — Thread `XrmToolBox`'s `LogInfo` / `LogWarning`
+- [x] **R13.1.1** *S* — Thread `XrmToolBox`'s `LogInfo` / `LogWarning`
   / `LogError` through the Core services via a small `IFlowLogger`
   interface (one method per log level, `string message` +
   optional `Exception`). Default implementation in `Core` is a
@@ -333,7 +413,7 @@ filtering. Add a **Search error text** toggle to opt into this.
   - **Acceptance:** `LogInfo` fires in the XrmToolBox log window
     for: every Dataverse query, every Flow API call, every auth
     acquisition, every pagination iteration.
-- [ ] **R13.1.2** *XS* — Replace the `MessageBox.Show` calls in
+- [x] **R13.1.2** *XS* — Replace the `MessageBox.Show` calls in
   `MainControl.LoadFlowsAsync` / `SearchFlowsAsync` with
   `LogError` + a non-modal `ToolStripStatusLabel` flash (red text
   for 5 s, then revert). `MessageBox` is fine for v0.1 but is a
@@ -343,7 +423,7 @@ filtering. Add a **Search error text** toggle to opt into this.
 
 #### R13.2 — `WorkAsync` and cancellation
 
-- [ ] **R13.2.1** *M* — Convert `LoadFlowsAsync`,
+- [x] **R13.2.1** *M* — Convert `LoadFlowsAsync`,
   `SearchFlowsAsync`, and the R11/R12 async methods to use
   `WorkAsync` / `WorkAsyncWrapper` instead of `Task.Run`. Wire
   `SetWorkingMessage` from `ProgressChanged`. *Deps:* R10.5.1.
@@ -351,7 +431,7 @@ filtering. Add a **Search error text** toggle to opt into this.
     "Searching 247 flows for 'abc'…", "Page 2 of 3", "Done" in
     order; only one long-running operation at a time (XrmToolBox
     blocks the second).
-- [ ] **R13.2.2** *S* — Add a `worker.CancellationPending` check in
+- [x] **R13.2.2** *S* — Add a `worker.CancellationPending` check in
   the pagination loop in `FlowQueryService` and in the per-flow
   loop in `SearchRunsAsync`. Add a **Cancel** toolbar button
   that calls `CancelWorker()`. *Deps:* R13.2.1.
@@ -361,50 +441,87 @@ filtering. Add a **Search error text** toggle to opt into this.
 
 #### R13.3 — Device-code UX
 
-- [ ] **R13.3.1** *M* — Replace the `MessageBox.Show` in
+- [x] **R13.3.1** *M* — Replace the `MessageBox.Show` in
   `FlowInterrogatorPlugin.InitializeServices` with a small
-  `DeviceCodeForm` (modal, shows URL in selectable text, code in
-  large monospace, **I've signed in** button that closes the form,
-  a **Cancel** button). Inject the callback from `MainControl`
-  (via a new `IDeviceCodePrompt` service) so the form lives in the
-  XTB project, not in the plugin constructor. *Deps:* R10.5.1.
-  - **Acceptance:** the device-code form is modeless to the
-    flow-search UI (user can keep reading existing results while
-    authenticating); the form times out gracefully if the user
-    walks away (MSAL has its own timeout — just don't block).
+  `DeviceCodeForm`. New files (both in the XTB project):
+  `DeviceCodeForm.cs` (a `Form` with `ShowIcon = false`,
+  `FormBorderStyle = FixedDialog`, `MinimizeBox = false`,
+  `MaximizeBox = false`, `StartPosition = CenterParent`) and
+  `IDeviceCodePrompt.cs` (a one-method interface:
+  `Task ShowDeviceCodeAsync(DeviceCodeInfo info);`). Form
+  contents: URL in a selectable read-only `TextBox` (so the user
+  can copy it), code in a large monospace `Label`
+  (`Font = new Font("Consolas", 18, FontStyle.Bold)`), an
+  **I've signed in** button (`DialogResult = OK`) and a
+  **Cancel** button (`DialogResult = Cancel`). The
+  `IDeviceCodePrompt` implementation in `MainControl` marshals
+  to the UI thread via `this.Invoke(...)` (or
+  `BeginInvoke` if you want fire-and-forget) and calls
+  `deviceCodeForm.Show(this)` — modeless, not `ShowDialog` —
+  so the user can keep using the rest of the UI while MSAL
+  polls the sign-in endpoint in the background. The form
+  auto-closes when the user clicks either button; MSAL keeps
+  polling regardless and the eventual token acquisition (or
+  `MsalOperationCanceledException` on cancel) is observed in
+  the log via R13.1.1. *Deps:* R10.5.1, R11.0.1 (the prompt
+  needs `MainControl`, which the plugin only resolves after
+  settings wiring).
+  - **Acceptance:** the form displays on the UI thread (verify
+    by throwing in the form's `Load` event handler — the
+    exception must surface via `Application.ThreadException`,
+    not silently disappear); clicking either button closes
+    the form without throwing; MSAL continues polling and the
+    eventual token is observed in the log; cancelling the form
+    causes the calling code to receive
+    `OperationCanceledException` (NOT a hang) within MSAL's
+    default 15-minute device-code timeout; the form is shown
+    `Show()`, not `ShowDialog()` — assert by verifying
+    `MainControl` is still interactive while the form is open
+    (e.g., a status bar update still works).
 
 #### R13.4 — Icon, metadata, repo hygiene
 
-- [ ] **R13.4.1** *XS* — Add an `IconBase64` to the MEF export
+- [x] **R13.4.1** *XS* — Add an `IconBase64` to the MEF export
   metadata. 32×32 PNG, ≤ 4 KB, base64-encoded. Use a temporary
   placeholder (Flow icon in 1-bit) if a designer isn't ready. *Deps:*
   none.
-- [ ] **R13.4.2** *XS* — Add `Company`, `Product`, `Copyright`,
+- [x] **R13.4.2** *XS* — Add `Company`, `Product`, `Copyright`,
   `NeutralLanguage`, `Version`, `FileVersion` to the XTB csproj
-  `PropertyGroup` and (separately) to the Core csproj. Add
-  `[assembly: …]` overrides in `Properties/AssemblyInfo.cs` for
-  the same values so the produced DLLs have the metadata. *Deps:*
+  `PropertyGroup` and (separately) to the Core csproj. **First**: set
+  `<GenerateAssemblyInfo>false</GenerateAssemblyInfo>` in both csprojs
+  — it's currently `true` and the auto-generated
+  `Microsoft.NET.Sdk` assembly info will fight any manual
+  `[assembly: AssemblyVersion]` etc. (CS0433 "type defined in
+  multiple assemblies" or duplicate-attribute warnings). After
+  flipping to `false`, create
+  `HeatherAmiDigital.FlowInterrogator.XrmToolBox/Properties/AssemblyInfo.cs`
+  and `…/Core/Properties/AssemblyInfo.cs` with the
+  `[assembly: AssemblyCompany("Heather Ami Digital")]`,
+  `[assembly: AssemblyProduct("Power Automate Flow Interrogator")]`,
+  `[assembly: AssemblyCopyright("Copyright (c) 2026 Heather Ami")]`,
+  `[assembly: AssemblyVersion("0.1.0.0")]`,
+  `[assembly: AssemblyFileVersion("0.1.0.0")]` attributes. *Deps:*
   none.
 
 #### R13.5 — Documentation
 
-- [ ] **R13.5.1** *S* — Create `docs/architecture.md`: the
+- [x] **R13.5.1** *S* — Create `docs/architecture.md`: the
   Core/XTB split, the DI container shape, the threading model
   (`WorkAsync` + UI marshalling), and why.
-- [ ] **R13.5.2** *S* — Create `docs/authentication.md`: MSAL
+- [x] **R13.5.2** *S* — Create `docs/authentication.md`: MSAL
   device code flow, the well-known client ID caveat, and how to
   swap in a custom App Registration.
-- [ ] **R13.5.3** *XS* — Create `docs/usage.md`: the daily
+- [x] **R13.5.3** *XS* — Create `docs/usage.md`: the daily
   workflow (vision §1) as a screenshot-free walkthrough.
-- [ ] **R13.5.4** *XS* — Create `docs/development.md`: prereqs
+- [x] **R13.5.4** *XS* — Create `docs/development.md`: prereqs
   (VS 2022 + .NET desktop workload), how to build, how to load
   the plugin into XrmToolBox from `bin\Debug\net48`.
-- [ ] **R13.5.5** *XS* — Rewrite `README.md` to match the actual
+- [x] **R13.5.5** *XS* — Rewrite `README.md` to match the actual
   feature set post-R11 and post-R12 (no more "planned").
 
 ### R14 — v0.1 release to XrmToolBox Tool Library
 
-- [ ] **R14.1** *S* — Configure `dotnet pack` in the XTB csproj:
+- [x] **R14.1** *S* — Configure `dotnet pack` in the XTB csproj:
   `<IsPackable>true</IsPackable>`, `<PackageId>HeatherAmiDigital
   .FlowInterrogator.XrmToolBox</PackageId>`, `<Version>0.1.0</
   Version>`, authors, license (`MIT`), `ProjectUrl`,
@@ -421,21 +538,21 @@ filtering. Add a **Search error text** toggle to opt into this.
 
 ### R15 — Tests (parallel to R11–R14; do as we go, don't backlog)
 
-- [ ] **R15.1** *M* — Add a Core test project
+- [x] **R15.1** *M* — Add a Core test project
   (`HeatherAmiDigital.FlowInterrogator.Core.Tests`,
   `xunit`, `net8.0` so the runner doesn't need .NET Fx). Add a
   `FakeIOrganizationService` test double that returns canned
   `EntityCollection` responses for paged `RetrieveMultiple`.
-- [ ] **R15.2** *M* — `FlowParserTests`: parse a known flow JSON
+- [x] **R15.2** *M* — `FlowParserTests`: parse a known flow JSON
   fixture (Scope > Condition > Switch > nested actions), assert
   action dictionary contains all leaves and respects `runAfter`.
   Cover `SearchDefinition` with case-insensitivity and snippet
   extraction.
-- [ ] **R15.3** *S* — `FlowQueryServiceTests`: paged retrieval
+- [x] **R15.3** *S* — `FlowQueryServiceTests`: paged retrieval
   (R11.1.2), `MapToSummary` covers null/missing attributes
   gracefully, `SearchFlowDefinitions` returns empty list for
   null/empty search term without hitting the service.
-- [ ] **R15.4** *S* — `FlowRunServiceTests` (need an
+- [x] **R15.4** *S* — `FlowRunServiceTests` (need an
   `HttpMessageHandler` fake): `GetRunsAsync` builds the right
   `$filter` string for given date + status combinations; surfaces
   non-2xx responses as `HttpRequestException` with the body in
@@ -579,9 +696,9 @@ Listed so we explicitly *don't* accidentally grow scope:
 
 ## 13. Open Decisions (closed with proposed defaults)
 
-These were §8 in the prior plan; each now has a proposed default so
-the plan is actionable rather than a question list. The user can
-override any of them at the start of R11.
+Each row records a design decision the implementation will make, with
+a proposed default so the plan is actionable rather than a question
+list. The user can override any of them at the start of R11.
 
 | # | Decision                                                | Proposed default                                                                 |
 |---|---------------------------------------------------------|----------------------------------------------------------------------------------|

@@ -20,17 +20,20 @@ public sealed class FlowRunService
     private const string BaseUrl = "https://api.flow.microsoft.com";
 
     private readonly HttpClient _httpClient;
-    private readonly PowerAutomateAuthService _authService;
+    private readonly ITokenProvider _tokenProvider;
+    private readonly IFlowLogger _logger;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="FlowRunService"/> class.
     /// </summary>
     /// <param name="httpClient">The HTTP client used for API requests.</param>
-    /// <param name="authService">The authentication service used to acquire Bearer tokens.</param>
-    public FlowRunService(HttpClient httpClient, PowerAutomateAuthService authService)
+    /// <param name="tokenProvider">The token provider used to acquire Bearer tokens.</param>
+    /// <param name="logger">Optional logger; defaults to a no-op logger when null.</param>
+    public FlowRunService(HttpClient httpClient, ITokenProvider tokenProvider, IFlowLogger logger = null)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
-        _authService = authService ?? throw new ArgumentNullException(nameof(authService));
+        _tokenProvider = tokenProvider ?? throw new ArgumentNullException(nameof(tokenProvider));
+        _logger = logger ?? NullFlowLogger.Instance;
     }
 
     /// <summary>
@@ -67,6 +70,8 @@ public sealed class FlowRunService
             url += "&$filter=" + string.Join(" and ", filters);
         }
 
+        _logger.Info($"Fetching runs for flow '{flowName}' ({flowId}).");
+
         var json = await SendAuthenticatedRequestAsync(url);
         var runs = new List<FlowRun>();
 
@@ -93,6 +98,8 @@ public sealed class FlowRunService
     {
         var url = $"{BaseUrl}/providers/Microsoft.ProcessSimple/environments/{environmentId}/flows/{flowId}/runs/{runId}/actions?api-version={ApiVersion}";
 
+        _logger.Info($"Fetching actions for run {runId} (flow {flowId}).");
+
         var json = await SendAuthenticatedRequestAsync(url);
         var actions = new List<FlowRunAction>();
 
@@ -108,11 +115,94 @@ public sealed class FlowRunService
     }
 
     /// <summary>
+    /// Searches run history across multiple flows, aggregating and filtering client-side.
+    /// The Flow Management API is per-flow and not batchable, so runs are fetched sequentially.
+    /// Matching is a case-insensitive substring test against the flow name, trigger name,
+    /// correlation id, and run id. Error-message search is handled separately and on-demand
+    /// via <see cref="GetFirstErrorMessageAsync"/>.
+    /// </summary>
+    /// <param name="flows">The flows whose run history should be searched.</param>
+    /// <param name="environmentId">The Power Platform environment identifier.</param>
+    /// <param name="term">The search term; when null or empty, all runs are returned.</param>
+    /// <param name="startDate">Optional. Filters runs to those started on or after this UTC date.</param>
+    /// <param name="statusFilter">Optional. Filters runs to a specific execution status.</param>
+    /// <param name="isCancellationRequested">Optional predicate polled between flows; stops early when true.</param>
+    /// <param name="onFlowProcessed">Optional progress callback receiving (processed, total) flow counts.</param>
+    /// <returns>A read-only list of matching runs across all flows, ordered by start time descending.</returns>
+    public async Task<IReadOnlyList<FlowRun>> SearchRunsAsync(
+        IReadOnlyCollection<FlowSummary> flows,
+        string environmentId,
+        string term,
+        DateTime? startDate = null,
+        FlowRunStatus? statusFilter = null,
+        Func<bool> isCancellationRequested = null,
+        Action<int, int> onFlowProcessed = null)
+    {
+        if (flows == null) throw new ArgumentNullException(nameof(flows));
+
+        _logger.Info($"Searching runs across {flows.Count} flows for '{term}'.");
+
+        var aggregated = new List<FlowRun>();
+        var total = flows.Count;
+        var processed = 0;
+
+        foreach (var flow in flows)
+        {
+            if (isCancellationRequested?.Invoke() == true)
+            {
+                _logger.Info("Cross-flow run search cancelled.");
+                break;
+            }
+
+            var runs = await GetRunsAsync(flow.Id, environmentId, flow.Name, startDate, statusFilter);
+            aggregated.AddRange(runs.Where(run => MatchesTerm(run, term)));
+
+            onFlowProcessed?.Invoke(++processed, total);
+        }
+
+        return aggregated.OrderByDescending(r => r.StartTime).ToList();
+    }
+
+    /// <summary>
+    /// Fetches the error message of the first failed action in a run.
+    /// Used by the opt-in error-text search to avoid eagerly pulling action data for every run.
+    /// </summary>
+    /// <param name="run">The run to inspect.</param>
+    /// <returns>The first failed action's error message, or <c>null</c> if none.</returns>
+    public async Task<string> GetFirstErrorMessageAsync(FlowRun run)
+    {
+        if (run == null) throw new ArgumentNullException(nameof(run));
+
+        var actions = await GetRunActionsAsync(run.FlowId, run.EnvironmentId, run.RunId);
+        return actions
+            .FirstOrDefault(a => a.Status == FlowRunStatus.Failed && !string.IsNullOrWhiteSpace(a.ErrorMessage))
+            ?.ErrorMessage;
+    }
+
+    private static bool MatchesTerm(FlowRun run, string term)
+    {
+        if (string.IsNullOrWhiteSpace(term))
+        {
+            return true;
+        }
+
+        return Contains(run.FlowName, term)
+            || Contains(run.TriggerName, term)
+            || Contains(run.CorrelationId, term)
+            || Contains(run.RunId, term);
+    }
+
+    private static bool Contains(string value, string term)
+    {
+        return value != null && value.IndexOf(term, StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    /// <summary>
     /// Sends an authenticated GET request to the Flow Management API.
     /// </summary>
     private async Task<JObject> SendAuthenticatedRequestAsync(string url)
     {
-        var token = await _authService.GetAccessTokenAsync();
+        var token = await _tokenProvider.GetAccessTokenAsync();
 
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
@@ -122,6 +212,7 @@ public sealed class FlowRunService
         if (!response.IsSuccessStatusCode)
         {
             var errorContent = await response.Content.ReadAsStringAsync();
+            _logger.Error($"Flow API request failed with status {(int)response.StatusCode}.");
             throw new HttpRequestException($"Flow API request failed with status {(int)response.StatusCode}: {errorContent}");
         }
 

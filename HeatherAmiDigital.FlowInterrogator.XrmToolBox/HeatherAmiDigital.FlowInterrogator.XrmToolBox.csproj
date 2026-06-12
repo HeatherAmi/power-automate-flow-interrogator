@@ -6,9 +6,25 @@
     <UseWindowsForms>true</UseWindowsForms>
     <RootNamespace>HeatherAmiDigital.FlowInterrogator.XrmToolBox</RootNamespace>
     <AssemblyName>HeatherAmiDigital.FlowInterrogator.XrmToolBox</AssemblyName>
-    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
     <GenerateBindingRedirectsOutputType>true</GenerateBindingRedirectsOutputType>
+  </PropertyGroup>
+
+  <!-- XrmToolBox Tool Library package metadata (R14.1). -->
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <PackageId>HeatherAmiDigital.FlowInterrogator.XrmToolBox</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Heather Ami</Authors>
+    <Company>Heather Ami Digital</Company>
+    <Product>Power Automate Flow Interrogator</Product>
+    <Description>XrmToolBox plugin to search Power Automate cloud flow definitions and investigate run history (triggers, actions, runtime inputs/outputs) directly against Dataverse.</Description>
+    <Copyright>Copyright (c) 2026 Heather Ami</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/heatherami/power-automate-flow-interrogator</PackageProjectUrl>
+    <PackageTags>xrmtoolbox plugin dataverse power-automate</PackageTags>
+    <PackageReleaseNotes>v0.1.0: definition search, single-flow definition fetch, per-flow run history with run/action detail, and cross-flow run search.</PackageReleaseNotes>
   </PropertyGroup>
 
   <ItemGroup>

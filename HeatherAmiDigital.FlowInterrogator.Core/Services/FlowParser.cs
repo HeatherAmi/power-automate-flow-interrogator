@@ -172,6 +172,12 @@ public sealed class FlowParser
         {
             ExtractActionsRecursive(elseValue, collectedActions);
         }
+
+        // Handle the default branch of a Switch
+        if (currentObj.TryGetValue("default", out var defaultValue))
+        {
+            ExtractActionsRecursive(defaultValue, collectedActions);
+        }
     }
 
     private FlowAction ParseAction(string name, JObject actionJson)

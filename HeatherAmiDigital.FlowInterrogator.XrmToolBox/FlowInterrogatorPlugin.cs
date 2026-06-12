@@ -12,34 +12,62 @@ using XrmToolBox.Extensibility.Interfaces;
 namespace HeatherAmiDigital.FlowInterrogator.XrmToolBox;
 
 /// <summary>
-/// Main entry point for the XrmToolBox plugin. 
-/// Handles MEF export, connection lifecycle, and Dependency Injection configuration.
+/// MEF entry point discovered by XrmToolBox. Acts as the plugin factory:
+/// XrmToolBox imports <see cref="IXrmToolBoxPlugin"/> exports and calls
+/// <see cref="GetControl"/> to instantiate the tool's UI.
 /// </summary>
-[Export(typeof(IXrmToolBoxPluginInterface)),
+[Export(typeof(IXrmToolBoxPlugin)),
  ExportMetadata("Name", "Power Automate Flow Interrogator"),
  ExportMetadata("Description", "Search and investigate Power Automate cloud flows and run history."),
- ExportMetadata("IconBase64", ""),
  ExportMetadata("BackgroundColor", "White"),
  ExportMetadata("PrimaryFontColor", "#333333"),
- ExportMetadata("SecondaryFontColor", "#666666")]
+ ExportMetadata("SecondaryFontColor", "#666666"),
+ ExportMetadata("SmallImageBase64", PluginIcon.SmallBase64),
+ ExportMetadata("BigImageBase64", PluginIcon.SmallBase64)]
+public sealed class FlowInterrogatorPluginFactory : PluginBase
+{
+    /// <summary>
+    /// Creates the tool's main control. Invoked by XrmToolBox each time the tool is opened.
+    /// </summary>
+    public override IXrmToolBoxPluginControl GetControl() => new FlowInterrogatorPlugin();
+}
+
+/// <summary>
+/// Hosts the plugin UI, owns the Dataverse connection lifecycle, and builds the
+/// Dependency Injection container for the Core services.
+/// </summary>
 public sealed class FlowInterrogatorPlugin : PluginControlBase
 {
-    private MainControl _mainControl;
+    private readonly MainControl _mainControl;
     private ServiceProvider _serviceProvider;
 
     /// <summary>
-    /// Initializes the plugin UI and registers event handlers.
+    /// Gets the persisted user settings for this tool, loaded once at construction and
+    /// saved when the tool closes.
+    /// </summary>
+    public FlowInterrogatorSettings Settings { get; }
+
+    /// <summary>
+    /// Initializes the plugin UI, loads settings, and registers lifecycle handlers.
     /// </summary>
     public FlowInterrogatorPlugin()
     {
-        _mainControl = new MainControl();
-        _mainControl.Dock = DockStyle.Fill;
+        Settings = LoadSettings();
+
+        _mainControl = new MainControl
+        {
+            Dock = DockStyle.Fill,
+            Host = this,
+            Settings = Settings
+        };
         Controls.Add(_mainControl);
 
-        // Subscribe to the close event to clean up DI resources when the tool is closed
-        this.OnCloseTool += (sender, e) => _serviceProvider?.Dispose();
+        OnCloseTool += (sender, e) =>
+        {
+            SettingsManager.Instance.Save(typeof(FlowInterrogatorSettings), Settings);
+            _serviceProvider?.Dispose();
+        };
     }
-
 
     /// <summary>
     /// Invoked by XrmToolBox when a new Dataverse connection is established or changed.
@@ -52,39 +80,54 @@ public sealed class FlowInterrogatorPlugin : PluginControlBase
     }
 
     /// <summary>
+    /// Loads the persisted settings, falling back to defaults when none exist or loading fails.
+    /// </summary>
+    private static FlowInterrogatorSettings LoadSettings()
+    {
+        try
+        {
+            if (SettingsManager.Instance.TryLoad(typeof(FlowInterrogatorSettings), out FlowInterrogatorSettings loaded) && loaded != null)
+            {
+                return loaded;
+            }
+        }
+        catch
+        {
+            // A corrupt or missing settings file must never block the tool from opening.
+        }
+
+        return new FlowInterrogatorSettings();
+    }
+
+    /// <summary>
     /// Configures and builds the Dependency Injection container for the Core services.
     /// </summary>
     private void InitializeServices(ConnectionDetail detail)
     {
+        var environmentId = ExtractEnvironmentId(detail);
+
         var services = new ServiceCollection();
 
+        services.AddSingleton<IFlowLogger>(new XrmToolBoxFlowLogger(this));
         services.AddSingleton<FlowParser>();
 
-        services.AddSingleton<FlowQueryService>(sp =>
+        services.AddSingleton(sp => new FlowQueryService(
+            Service,
+            sp.GetRequiredService<FlowParser>(),
+            sp.GetRequiredService<IFlowLogger>())
         {
-            var parser = sp.GetRequiredService<FlowParser>();
-            return new FlowQueryService(Service, parser)
-            {
-                EnvironmentId = ExtractEnvironmentId(detail)
-            };
+            EnvironmentId = environmentId
         });
 
-        services.AddSingleton<PowerAutomateAuthService>(sp =>
-        {
-            return new PowerAutomateAuthService(result =>
-            {
-                // Fallback UI for device code prompt; the MainControl will override this with a better dialog later
-                MessageBox.Show(
-                    $"Please visit {result.VerificationUrl} and enter code:\n\n{result.UserCode}",
-                    "Power Automate Authentication",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
-                return System.Threading.Tasks.Task.CompletedTask;
-            });
-        });
+        services.AddSingleton(sp => new PowerAutomateAuthService(
+            result => _mainControl.ShowDeviceCodeAsync(result)));
+        services.AddSingleton<ITokenProvider>(sp => sp.GetRequiredService<PowerAutomateAuthService>());
 
         services.AddSingleton<HttpClient>();
-        services.AddSingleton<FlowRunService>();
+        services.AddSingleton(sp => new FlowRunService(
+            sp.GetRequiredService<HttpClient>(),
+            sp.GetRequiredService<ITokenProvider>(),
+            sp.GetRequiredService<IFlowLogger>()));
 
         _serviceProvider?.Dispose();
         _serviceProvider = services.BuildServiceProvider();
@@ -100,15 +143,14 @@ public sealed class FlowInterrogatorPlugin : PluginControlBase
     {
         if (detail == null) return null;
 
-        // Modern Dataverse connections expose the Environment ID directly
+        // Modern Dataverse connections expose the Environment ID directly.
         if (!string.IsNullOrWhiteSpace(detail.EnvironmentId))
         {
             return detail.EnvironmentId;
         }
 
-        // Fallback for older connection types
-        return detail.Organization.ToString();
+        // Fallback for older connection types (yields the org URL, not a Default-{guid} id;
+        // deep links may be inaccurate — documented as out of scope for v0.1).
+        return detail.Organization?.ToString();
     }
 }
-
- 

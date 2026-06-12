@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.ServiceModel;
 using HeatherAmiDigital.FlowInterrogator.Core.Models;
 using Microsoft.Xrm.Sdk;
 using Microsoft.Xrm.Sdk.Query;
@@ -13,8 +14,17 @@ namespace HeatherAmiDigital.FlowInterrogator.Core.Services;
 /// </summary>
 public sealed class FlowQueryService
 {
+    /// <summary>The Dataverse page size used when paging large flow result sets.</summary>
+    private const int PageSize = 5000;
+
+    /// <summary>
+    /// Dataverse fault error code (0x80040217) returned when a requested record does not exist.
+    /// </summary>
+    private const int ObjectDoesNotExistErrorCode = -2147220969;
+
     private readonly IOrganizationService _service;
     private readonly FlowParser _parser;
+    private readonly IFlowLogger _logger;
 
     /// <summary>
     /// Gets or sets the Power Platform environment identifier (e.g., <c>Default-{tenantId}</c>).
@@ -28,10 +38,12 @@ public sealed class FlowQueryService
     /// </summary>
     /// <param name="service">The Dataverse organization service used to execute queries.</param>
     /// <param name="parser">The parser used to deserialize and search flow definitions.</param>
-    public FlowQueryService(IOrganizationService service, FlowParser parser)
+    /// <param name="logger">Optional logger; defaults to a no-op logger when null.</param>
+    public FlowQueryService(IOrganizationService service, FlowParser parser, IFlowLogger logger = null)
     {
         _service = service ?? throw new ArgumentNullException(nameof(service));
         _parser = parser ?? throw new ArgumentNullException(nameof(parser));
+        _logger = logger ?? NullFlowLogger.Instance;
     }
 
     /// <summary>
@@ -41,52 +53,83 @@ public sealed class FlowQueryService
     /// <returns>A read-only list of flow summaries.</returns>
     public IReadOnlyList<FlowSummary> GetFlowSummaries()
     {
-        var query = new QueryExpression("workflow")
+        _logger.Info("Querying Dataverse for cloud flow summaries.");
+
+        var query = BuildFlowQuery(includeClientData: false);
+        var summaries = new List<FlowSummary>();
+
+        foreach (var entity in RetrieveAll(query, isCancellationRequested: null, onPageRetrieved: null))
         {
-            NoLock = true, // Avoid blocking other transactions in the production environment
-            ColumnSet = new ColumnSet(
-                "workflowid", "name", "description", "statecode",
-                "createdon", "modifiedon", "ownerid")
-        };
+            summaries.Add(MapToSummary(entity));
+        }
 
-        // Category 5 = Modern Flow (Power Automate cloud flow)
-        query.Criteria.AddCondition("category", ConditionOperator.Equal, 5);
+        _logger.Info($"Retrieved {summaries.Count} cloud flow summaries.");
 
-        var results = _service.RetrieveMultiple(query);
-
-        return results.Entities
-            .Select(MapToSummary)
+        return summaries
             .OrderByDescending(f => f.ModifiedOn)
             .ToList();
     }
 
     /// <summary>
+    /// Retrieves and parses the definition of a single cloud flow by its Dataverse identifier.
+    /// </summary>
+    /// <param name="flowId">The Dataverse <c>workflowid</c> of the flow.</param>
+    /// <returns>
+    /// The parsed <see cref="FlowDefinition"/>, or <c>null</c> if the record no longer exists.
+    /// A record with empty <c>clientdata</c> yields a definition with no triggers or actions.
+    /// </returns>
+    public FlowDefinition GetFlowDefinition(Guid flowId)
+    {
+        _logger.Info($"Retrieving definition for flow {flowId}.");
+
+        Entity entity;
+        try
+        {
+            entity = _service.Retrieve(
+                "workflow",
+                flowId,
+                new ColumnSet("clientdata", "name", "description", "statecode", "modifiedon"));
+        }
+        catch (FaultException<OrganizationServiceFault> ex) when (ex.Detail?.ErrorCode == ObjectDoesNotExistErrorCode)
+        {
+            _logger.Warning($"Flow {flowId} no longer exists in Dataverse.");
+            return null;
+        }
+
+        var rawJson = entity.GetAttributeValue<string>("clientdata");
+        return _parser.ParseDefinition(flowId, rawJson);
+    }
+
+    /// <summary>
     /// Searches the definitions of all cloud flows for a specific term.
     /// Fetches the <c>clientdata</c> column, parses the JSON, and returns matching nodes.
+    /// Results are paged to stay within the Dataverse response size cap on large environments.
     /// </summary>
     /// <param name="searchTerm">The term to search for (e.g., a GUID, email address, or URL).</param>
+    /// <param name="onPageRetrieved">
+    /// Optional callback invoked after each page is retrieved, receiving the 1-based page number.
+    /// </param>
+    /// <param name="isCancellationRequested">
+    /// Optional predicate polled between pages; when it returns <c>true</c> the search stops and
+    /// returns the matches gathered so far.
+    /// </param>
     /// <returns>A read-only list of matches found across all flow definitions.</returns>
-    public IReadOnlyList<FlowMatch> SearchFlowDefinitions(string searchTerm)
+    public IReadOnlyList<FlowMatch> SearchFlowDefinitions(
+        string searchTerm,
+        Action<int> onPageRetrieved = null,
+        Func<bool> isCancellationRequested = null)
     {
         if (string.IsNullOrWhiteSpace(searchTerm))
         {
             return Array.Empty<FlowMatch>();
         }
 
-        var query = new QueryExpression("workflow")
-        {
-            NoLock = true,
-            ColumnSet = new ColumnSet(
-                "workflowid", "name", "description", "statecode",
-                "createdon", "modifiedon", "ownerid", "clientdata")
-        };
+        _logger.Info($"Searching all flow definitions for '{searchTerm}'.");
 
-        query.Criteria.AddCondition("category", ConditionOperator.Equal, 5);
-
-        var results = _service.RetrieveMultiple(query);
+        var query = BuildFlowQuery(includeClientData: true);
         var matches = new List<FlowMatch>();
 
-        foreach (var entity in results.Entities)
+        foreach (var entity in RetrieveAll(query, isCancellationRequested, onPageRetrieved))
         {
             var summary = MapToSummary(entity);
             var rawJson = entity.GetAttributeValue<string>("clientdata");
@@ -97,12 +140,78 @@ public sealed class FlowQueryService
             }
 
             var definition = _parser.ParseDefinition(summary.Id, rawJson);
-            var flowMatches = _parser.SearchDefinition(summary, definition, searchTerm);
-
-            matches.AddRange(flowMatches);
+            matches.AddRange(_parser.SearchDefinition(summary, definition, searchTerm));
         }
 
+        _logger.Info($"Search for '{searchTerm}' found {matches.Count} matches.");
         return matches;
+    }
+
+    /// <summary>
+    /// Builds the base <c>workflow</c> query filtered to modern cloud flows (category 5),
+    /// with <see cref="QueryExpression.NoLock"/> set for production safety.
+    /// </summary>
+    private static QueryExpression BuildFlowQuery(bool includeClientData)
+    {
+        var columns = new List<string>
+        {
+            "workflowid", "name", "description", "statecode",
+            "createdon", "modifiedon", "ownerid"
+        };
+
+        if (includeClientData)
+        {
+            columns.Add("clientdata");
+        }
+
+        var query = new QueryExpression("workflow")
+        {
+            NoLock = true, // Avoid blocking other transactions in the production environment
+            ColumnSet = new ColumnSet(columns.ToArray()),
+            PageInfo = new PagingInfo { Count = PageSize, PageNumber = 1 }
+        };
+
+        // Category 5 = Modern Flow (Power Automate cloud flow)
+        query.Criteria.AddCondition("category", ConditionOperator.Equal, 5);
+
+        return query;
+    }
+
+    /// <summary>
+    /// Executes a paged retrieval, yielding every matching entity across all pages.
+    /// Stops early if <paramref name="isCancellationRequested"/> returns <c>true</c>.
+    /// </summary>
+    private IEnumerable<Entity> RetrieveAll(
+        QueryExpression query,
+        Func<bool> isCancellationRequested,
+        Action<int> onPageRetrieved)
+    {
+        while (true)
+        {
+            if (isCancellationRequested?.Invoke() == true)
+            {
+                _logger.Info($"Retrieval cancelled before page {query.PageInfo.PageNumber}.");
+                yield break;
+            }
+
+            var results = _service.RetrieveMultiple(query);
+            _logger.Info($"Retrieved page {query.PageInfo.PageNumber} ({results.Entities.Count} records).");
+
+            foreach (var entity in results.Entities)
+            {
+                yield return entity;
+            }
+
+            onPageRetrieved?.Invoke(query.PageInfo.PageNumber);
+
+            if (!results.MoreRecords)
+            {
+                yield break;
+            }
+
+            query.PageInfo.PageNumber++;
+            query.PageInfo.PagingCookie = results.PagingCookie;
+        }
     }
 
     /// <summary>

@@ -5,6 +5,7 @@
     <LangVersion>latest</LangVersion>
     <RootNamespace>HeatherAmiDigital.FlowInterrogator.Core</RootNamespace>
     <AssemblyName>HeatherAmiDigital.FlowInterrogator.Core</AssemblyName>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
   </PropertyGroup>
 
   <ItemGroup>
